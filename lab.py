@@ -1,4 +1,12 @@
-"""macOS physical-volume test driver. Tests policy; does not implement recovery."""
+"""Physical-volume test driver. Tests policy; does not implement recovery.
+
+On macOS the isolated volume is a 128 MiB HFS+ image created with hdiutil
+and the worker is supervised by the per-user LaunchAgent.  On Linux the
+driver uses a small dedicated tmpfs (such as /dev/shm) and a minimal
+KeepAlive-style supervisor, so the same real-ENOSPC boundaries are
+exercised without ever filling the host disk.  All assertions are
+identical on both platforms.
+"""
 import argparse
 import errno
 import hashlib
@@ -7,15 +15,20 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 
 import checks
 import ops
 import pipeline
+
+DARWIN = sys.platform == "darwin"
 
 
 def command(argv, **kwargs):
@@ -33,9 +46,35 @@ def wait_for(predicate, message, seconds=30):
     raise AssertionError(message)
 
 
+def linux_mount(directory):
+    """A fresh directory on a small dedicated tmpfs; refuses anything else."""
+    shm = Path("/dev/shm")
+    mounts = Path("/proc/mounts").read_bytes().decode()
+    if not any(len(fields) >= 3 and fields[1] == "/dev/shm" and fields[2] == "tmpfs"
+               for fields in (line.split() for line in mounts.splitlines())):
+        raise ValueError("NO_ISOLATED_VOLUME")
+    stats = os.statvfs(shm)
+    total = stats.f_blocks * stats.f_frsize
+    if not 32 * 1024 * 1024 <= total <= 256 * 1024 * 1024:
+        # Only ever fill a small dedicated scratch volume, never a large share.
+        raise ValueError("UNSAFE_VOLUME_SIZE")
+    for stale in shm.glob("sampling-lab-*"):
+        try:
+            pid = int(stale.name.split("-")[2])
+        except (IndexError, ValueError):
+            continue
+        if not Path("/proc/%d" % pid).exists():
+            shutil.rmtree(stale, ignore_errors=True)
+    mount = shm / ("sampling-lab-%d-%s" % (os.getpid(), directory.name))
+    mount.mkdir()
+    return mount
+
+
 def create(directory):
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=False)
+    if not DARWIN:
+        return linux_mount(directory)
     image, mount = directory / "data.dmg", directory / "volume"
     mount.mkdir()
     command(["hdiutil", "create", "-size", "128m", "-fs", "HFS+",
@@ -45,10 +84,15 @@ def create(directory):
 
 
 def fill(mount):
-    # Confined to a private image. Never fills the host startup volume.
+    # Confined to a private volume. Never fills the host startup volume.
     mount = Path(mount).resolve()
-    if not (mount.parent / "data.dmg").is_file() or not os.path.ismount(mount):
-        raise ValueError("NOT_LAB_VOLUME")
+    if DARWIN:
+        if not (mount.parent / "data.dmg").is_file() or not os.path.ismount(mount):
+            raise ValueError("NOT_LAB_VOLUME")
+    else:
+        shm = Path("/dev/shm").resolve()
+        if mount.parent != shm or os.stat(mount).st_dev != os.stat(shm).st_dev:
+            raise ValueError("NOT_LAB_VOLUME")
     total = 0
     block = b"x" * 65536
     with (mount / "ballast").open("wb", buffering=0) as target:
@@ -93,12 +137,105 @@ def detached_build(release_path, directory):
     return built
 
 
+class LaunchAgentService:
+    """macOS per-user agent supervision (existing behavior)."""
+
+    def __init__(self, root):
+        self.root = root
+        self.target = "gui/" + str(os.getuid()) + "/" + ops.identity(root)
+
+    def start(self):
+        ops.start(self.root)
+
+    def pid(self):
+        text = command(["launchctl", "print", self.target])
+        match = re.search(r"\bpid = ([0-9]+)", text)
+        return int(match[1]) if match else None
+
+    def kill(self):
+        command(["launchctl", "kill", "SIGKILL", self.target])
+
+    def stop(self):
+        ops.stop(self.root)
+
+
+class Supervisor:
+    """Minimal KeepAlive-style restarter where launchd is unavailable."""
+
+    def __init__(self, argv, control, env, cwd):
+        self.argv = [str(arg) for arg in argv]
+        self.control = Path(control)
+        self.env = env
+        self.cwd = cwd
+        self.child = None
+        self.halted = False
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while not self.halted:
+            if self.child is None or self.child.poll() is not None:
+                with (self.control / "service.stdout").open("ab") as out, \
+                        (self.control / "service.stderr").open("ab") as err:
+                    self.child = subprocess.Popen(self.argv, stdout=out, stderr=err,
+                                                  env=self.env, cwd=self.cwd)
+                time.sleep(1.0)  # Restart throttle, mirroring ThrottleInterval.
+            else:
+                time.sleep(0.05)
+
+    def pid(self):
+        if self.child is not None and self.child.poll() is None:
+            return self.child.pid
+        return None
+
+    def kill(self):
+        if self.child is not None and self.child.poll() is None:
+            self.child.send_signal(signal.SIGKILL)
+
+    def stop(self):
+        self.halted = True
+        if self.thread is not None:
+            self.thread.join(timeout=10)
+        child = self.child
+        if child is not None and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+
+
+class SupervisorService:
+    """Linux stand-in for the LaunchAgent with the same KeepAlive contract."""
+
+    def __init__(self, app, root, control, env, cwd):
+        self.supervisor = Supervisor([sys.executable, app, "worker", root],
+                                     control, env, cwd)
+
+    def start(self):
+        self.supervisor.start()
+
+    def pid(self):
+        return self.supervisor.pid()
+
+    def kill(self):
+        self.supervisor.kill()
+
+    def stop(self):
+        self.supervisor.stop()
+
+
 def case(release_path, directory, phase):
     directory = Path(directory).resolve()
     mount = create(directory)
     root, control = mount / "service", directory / "control"
     evidence = {"phase": phase, "source_removed": False}
     installed = False
+    service = None
     try:
         release_copy = detached_build(release_path, directory)
         evidence["source_removed"] = not (directory / "development").exists()
@@ -107,6 +244,8 @@ def case(release_path, directory, phase):
         app = root / "app.pyz"
         env = dict(os.environ)
         env.pop("PYTHONPATH", None)
+        service = (LaunchAgentService(root) if DARWIN
+                   else SupervisorService(app, root, control, env, directory))
 
         def call(*args):
             return json.loads(command([sys.executable, app, *args], cwd=directory, env=env))
@@ -118,7 +257,7 @@ def case(release_path, directory, phase):
         evidence["accepted"] = accepted
         if phase != "normal":
             (control / "hook.json").write_bytes(pipeline.encode({"phase": phase}))
-        ops.start(root)
+        service.start()
         if phase != "normal":
             wait_for(lambda: (control / (phase + ".ready")).exists(), "BOUNDARY_NOT_REACHED")
             evidence["physical_full"] = fill(mount)
@@ -142,18 +281,11 @@ def case(release_path, directory, phase):
             finally:
                 db.close()
 
-            target = "gui/" + str(os.getuid()) + "/" + ops.identity(root)
-
-            def pid():
-                text = command(["launchctl", "print", target])
-                match = re.search(r"\bpid = ([0-9]+)", text)
-                return int(match[1]) if match else None
-
-            before = wait_for(pid, "SERVICE_PID_MISSING")
-            command(["launchctl", "kill", "SIGKILL", target])
+            before = wait_for(service.pid, "SERVICE_PID_MISSING")
+            service.kill()
             evidence["killed_pid"] = before
             evidence["restarted_pid"] = wait_for(
-                lambda: (value if (value := pid()) and value != before else None),
+                lambda: (value if (value := service.pid()) and value != before else None),
                 "LAUNCHAGENT_DID_NOT_RESTART")
             # Still full at restart; status must remain recoverable before we release bytes.
             evidence["after_restart"] = wait_for(paused, "PAUSE_LOST_ON_RESTART")
@@ -179,10 +311,23 @@ def case(release_path, directory, phase):
         return evidence
     finally:
         if installed:
-            ops.stop(root)
-        # Preserve the image and evidence, but always release the mount and service.
-        subprocess.run(["hdiutil", "detach", str(mount)], capture_output=True)
+            service.stop()
+        if DARWIN:
+            # Preserve the image and evidence, but always release the mount and service.
+            subprocess.run(["hdiutil", "detach", str(mount)], capture_output=True)
+        else:
+            shutil.rmtree(mount, ignore_errors=True)
         (directory / "evidence.json").write_bytes(pipeline.encode(evidence))
+
+
+def verify_all(release, directory):
+    base = Path(directory).resolve()
+    base.mkdir(parents=True, exist_ok=False)
+    records = [case(release, base / phase, phase)
+               for phase in ("normal", "stage", "result", "ledger")]
+    (base / "evidence.json").write_bytes(pipeline.encode(records))
+    return {"regression": "ONLINE_REGRESSION_OK",
+            "cases": [record["phase"] for record in records]}
 
 
 def main():
@@ -208,13 +353,7 @@ def main():
     elif args.operation == "case":
         print(json.dumps(case(args.release, args.directory, args.phase), sort_keys=True))
     else:
-        base = Path(args.directory).resolve()
-        base.mkdir(parents=True, exist_ok=False)
-        records = [case(args.release, base / phase, phase)
-                   for phase in ("normal", "stage", "result", "ledger")]
-        (base / "evidence.json").write_bytes(pipeline.encode(records))
-        print(json.dumps({"regression": "ONLINE_REGRESSION_OK",
-                          "cases": [r["phase"] for r in records]}, sort_keys=True))
+        print(json.dumps(verify_all(args.release, args.directory), sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -57,6 +57,13 @@ python3 lab.py verify OUT NEW_DIRECTORY
 
 手工工具入口为 lab.py create NEW_DIRECTORY、fill MOUNT、release MOUNT。barrier 从 CONTROL/hook.json 读取 {"phase":"stage"}（或 result、ledger），写 PHASE.ready 后等 PHASE.go；通过后写 PHASE.spent，重启不再等待同一钩子。工具和钩子仅用于稳定触发真实写失败，不提供恢复策略。
 
+## 本轮交付的恢复实现与新增入口
+
+空间不足恢复已实现：写满（ENOSPC/SQLITE_FULL）时当前批次持久进入 paused_space，半成品不入正式路径、无回执、无 ledger 行；释放空间后工作者自动续跑完成，重投同批不重复入账。恢复状态只在 ROOT 数据卷（state.sqlite 与 work/.reserve 预留文件）。操作员恢复步骤见 RECOVERY.md。lab.py 在 macOS 使用 hdiutil 映像与 LaunchAgent；在无 launchd 的 Linux 上改用独立小 tmpfs 卷（如 /dev/shm）与 KeepAlive 监督器，断言不变，仍是真实物理 ENOSPC。
+
+- python3 ops.py verify [DIRECTORY]：构建发布包，执行业务回归与物理满盘上线回归（正常 + stage/result/ledger 三边界），证据写入新实验目录。
+- python3 ops.py demo [DIRECTORY]：全新目录安装发布包，经安装产物提交并运行一个真实批次，展示结果与回执。
+
 ## 交付
 
 交付恢复实现、可安装发布包及简短恢复操作说明，留下实际实验命令、空间错误、暂停状态、重启和最终核账证据。说明如何启动、查看暂停、释放空间和确认已完成，不让操作员手改数据库。

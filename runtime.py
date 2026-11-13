@@ -1,4 +1,16 @@
-"""Manual runner and current unattended runner, sharing the existing kernel."""
+"""Manual runner and unattended worker, sharing the existing kernel.
+
+Disk-full recovery policy: when the data volume runs out of space while
+staging the intermediate payload, writing the result file, or committing
+the ledger transaction, the active batch is parked in the durable
+``paused_space`` state, partial payloads are removed, and the worker
+retries automatically until enough space is freed.  A reserve file kept
+on the same data volume guarantees room for the pause bookkeeping on an
+otherwise full disk.  Only ENOSPC and SQLITE_FULL (including extended
+codes) count as space faults; any other failure keeps propagating and is
+never reported as a space pause.  Recovery state lives only in ROOT.
+"""
+import errno
 import fcntl
 from contextlib import contextmanager
 import hashlib
@@ -18,6 +30,13 @@ CREATE TABLE jobs(
 );
 CREATE TABLE ledger(id TEXT PRIMARY KEY, result BLOB NOT NULL, receipt TEXT NOT NULL);
 """
+
+ACTIVE = ("pending", "running", "paused_space")
+PAUSED = "paused_space"
+# Room kept on the data volume so the pause marker always fits on a full disk.
+RESERVE_BYTES = 4 * 1024 * 1024
+RESERVE_NAME = ".reserve"
+PAUSE_RETRY_SECONDS = 2.0
 
 
 @contextmanager
@@ -41,6 +60,7 @@ def init(root, control):
     with connect(root) as db:
         db.executescript(SCHEMA)
     (root / "config.json").write_bytes(encode({"control": str(control)}))
+    ensure_reserve(root)
 
 
 def barrier(root, phase):
@@ -63,6 +83,36 @@ def sync_directory(directory):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def is_space_error(error):
+    """Only ENOSPC and SQLITE_FULL (with extended codes) are space faults."""
+    if isinstance(error, OSError):
+        return error.errno == errno.ENOSPC
+    if isinstance(error, sqlite3.Error):
+        code = getattr(error, "sqlite_errorcode", None)
+        return code is not None and code & 0xFF == sqlite3.SQLITE_FULL
+    return False
+
+
+def reserve_path(root):
+    return Path(root) / "work" / RESERVE_NAME
+
+
+def ensure_reserve(root):
+    """Keep the space reserve on the data volume; recreated whenever missing."""
+    path = reserve_path(root)
+    if path.exists():
+        return
+    temporary = path.with_name(RESERVE_NAME + ".tmp")
+    chunk = b"\0" * (1024 * 1024)
+    with temporary.open("wb") as target:
+        for _ in range(RESERVE_BYTES // len(chunk)):
+            target.write(chunk)
+        target.flush()
+        os.fsync(target.fileno())
+    os.replace(temporary, path)
+    sync_directory(path.parent)
 
 
 def submit(root, batch):
@@ -101,34 +151,86 @@ def commit_result(db, name, result, ack, path):
                    (encode(ack).decode(), path, name))
 
 
-def run_one(root):
+def write_file(path, writer):
+    with path.open("wb") as target:
+        writer(target)
+        target.flush()
+        os.fsync(target.fileno())
+
+
+def process(root, name, digest):
+    """Replayable pipeline for one accepted batch; derived files are atomic."""
     root = Path(root)
-    with connect(root) as db:
-        job = db.execute("SELECT id,digest FROM jobs WHERE state='pending' ORDER BY id LIMIT 1").fetchone()
-        if job is None:
-            return False
-        name, digest = job
-        db.execute("UPDATE jobs SET state='running' WHERE id=?", (name,))
     batch = json.loads((root / "inputs" / (name + ".json")).read_bytes())
     intermediate = root / "work" / (name + ".jsonl")
     barrier(root, "stage")
-    with intermediate.open("wb") as target:
-        stage(batch, target)
-        target.flush()
-        os.fsync(target.fileno())
+    temporary = intermediate.with_name(intermediate.name + ".partial")
+    write_file(temporary, lambda target: stage(batch, target))
+    os.replace(temporary, intermediate)
+    sync_directory(intermediate.parent)
     with intermediate.open("rb") as source:
         result = encode(summarize(source))
     destination = root / "results" / (name + ".json")
     barrier(root, "result")
-    with destination.open("wb") as target:
-        target.write(result)
-        target.flush()
-        os.fsync(target.fileno())
+    temporary = destination.with_name(destination.name + ".partial")
+    write_file(temporary, lambda target: target.write(result))
+    os.replace(temporary, destination)
+    sync_directory(destination.parent)
     ack = receipt(name, digest, result)
     barrier(root, "ledger")
     with connect(root) as db:
         commit_result(db, name, result, ack, str(destination.relative_to(root)))
-    return True
+
+
+def pause(root, name):
+    """Durably record the space pause; never touches results, ledger, or input."""
+    root = Path(root)
+    # Free bookkeeping room on the full volume before writing the marker.
+    reserve_path(root).unlink(missing_ok=True)
+    for partial in (root / "work" / (RESERVE_NAME + ".tmp"),
+                    root / "work" / (name + ".jsonl.partial"),
+                    root / "results" / (name + ".json.partial")):
+        partial.unlink(missing_ok=True)
+    try:
+        with connect(root) as db:
+            db.execute("UPDATE jobs SET state=? WHERE id=? AND state != 'completed'",
+                       (PAUSED, name))
+    except Exception as error:
+        if not is_space_error(error):
+            raise
+        # No room even for the marker; the next attempt records the pause again.
+
+
+def attempt(root):
+    """Drive the single active batch once; returns 'done', 'paused', or None."""
+    root = Path(root)
+    with connect(root) as db:
+        job = db.execute(
+            "SELECT id,digest,state FROM jobs WHERE state IN ('pending','running','paused_space')"
+            " ORDER BY id LIMIT 1").fetchone()
+    if job is None:
+        return None
+    name, digest, state = job
+    try:
+        if state == "pending":
+            with connect(root) as db:
+                db.execute("UPDATE jobs SET state='running' WHERE id=?", (name,))
+        ensure_reserve(root)
+        process(root, name, digest)
+    except Exception as error:
+        if not is_space_error(error):
+            raise
+        pause(root, name)
+        return "paused"
+    try:
+        ensure_reserve(root)  # Top up for the next batch; failure pauses that batch later.
+    except OSError:
+        pass
+    return "done"
+
+
+def run_one(root):
+    return attempt(root) == "done"
 
 
 def status(root):
@@ -156,5 +258,8 @@ def worker(root):
     with (root / "worker.lock").open("a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         while True:
-            if not run_one(root):
+            outcome = attempt(root)
+            if outcome == "paused":
+                time.sleep(PAUSE_RETRY_SECONDS)
+            elif outcome is None:
                 time.sleep(0.2)

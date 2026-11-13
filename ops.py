@@ -1,4 +1,4 @@
-"""Working packaging and user-service scaffold; no recovery policy."""
+"""Packaging, user-service scaffold, and verify/demo orchestration."""
 import argparse
 import hashlib
 import io
@@ -8,6 +8,7 @@ from pathlib import Path
 import plistlib
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 import runtime
@@ -98,6 +99,67 @@ def stop(root):
     return {"stopped": identity(root)}
 
 
+def fresh_directory(base):
+    base = Path(base)
+    candidate, counter = base, 2
+    while candidate.exists():
+        candidate = base.with_name(base.name + "-" + str(counter))
+        counter += 1
+    return candidate
+
+
+def verify(directory):
+    """Business regression plus physical full-disk online regression.
+
+    Everything business-facing runs against the installed product, not the
+    development checkout: the release is built here, installed by the lab
+    driver, and exercised through ROOT/app.pyz.
+    """
+    import checks
+    import lab
+    base = fresh_directory(directory)
+    base.mkdir(parents=True)
+    release = base / "release.zip"
+    manifest = build(release)
+    normal = checks.normal()
+    online = lab.verify_all(release, base / "online")
+    return {"regression": "VERIFY_OK", "normal": normal["regression"],
+            "online": online, "release_sha256": manifest["sha256"],
+            "evidence": str(base.resolve())}
+
+
+def demo(directory=None):
+    """Install the release into a fresh directory and show one real batch."""
+    import checks
+    if directory is None:
+        base = Path(tempfile.mkdtemp(prefix="sampling-demo-"))
+    else:
+        base = fresh_directory(directory)
+        base.mkdir(parents=True)
+    release = base / "release.zip"
+    build(release)
+    root, control = base / "root", base / "control"
+    install(release, root, control)
+    app = root / "app.pyz"
+    env = dict(os.environ)
+    env.pop("PYTHONPATH", None)
+
+    def call(*args):
+        return json.loads(subprocess.run(
+            [sys.executable, app, *[str(arg) for arg in args]],
+            check=True, capture_output=True, text=True, env=env).stdout)
+
+    batch = checks.small()
+    fixture = base / "input.json"
+    fixture.write_bytes(runtime.encode(batch))
+    accepted = call("submit", root, fixture)
+    processed = call("run", root)
+    shown = call("read", root, batch["batch_id"])
+    installed = checks.installed(root, batch)
+    return {"demo": "DEMO_OK", "directory": str(base), "accepted": accepted,
+            "processed": processed, "read": shown, "installed": installed}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     subs = parser.add_subparsers(dest="operation", required=True)
@@ -113,6 +175,10 @@ def main(argv=None):
         item = subs.add_parser(name)
         item.add_argument("root")
         item.add_argument(argument)
+    verify_parser = subs.add_parser("verify")
+    verify_parser.add_argument("directory", nargs="?", default="verify-evidence")
+    demo_parser = subs.add_parser("demo")
+    demo_parser.add_argument("directory", nargs="?", default=None)
     subs.add_parser("selftest")
     args = parser.parse_args(argv)
     if args.operation == "build":
@@ -134,6 +200,10 @@ def main(argv=None):
     elif args.operation == "worker":
         runtime.worker(args.root)
         return
+    elif args.operation == "verify":
+        value = verify(args.directory)
+    elif args.operation == "demo":
+        value = demo(args.directory)
     else:
         import checks
         value = checks.normal()
